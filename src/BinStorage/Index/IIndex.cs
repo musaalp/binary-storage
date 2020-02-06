@@ -2,7 +2,7 @@
 
 namespace BinStorage.Index
 {
-    public interface IIndex : IDisposable
+    public interface IIndex : ITransaction, IDisposable
     {
         void Add(string key, IndexData indexData);
 
