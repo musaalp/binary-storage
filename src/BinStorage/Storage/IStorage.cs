@@ -4,7 +4,7 @@ using System.IO;
 
 namespace BinStorage.Storage
 {
-    public interface IStorage : IDisposable
+    public interface IStorage : ITransaction, IDisposable
     {
         IndexData Append(Stream input);
 
