@@ -12,118 +12,119 @@ namespace BinStorage.Index
     public class PersistentIndex : IIndex
     {
         private readonly string _indexFilePath;
-
+        private readonly RootNode _rootNode;
         private long _capacity;
         private long _indexCursor;
         private long _cursorPositionBeforeAction;
         private MemoryMappedFile _indexFile;
-        private RootNode _rootNode;
+        private bool _disposed;
 
-        /// <summary>
-        /// Initializes a new instance of the <see cref="PersistentIndex"/> class.
-        /// </summary>
-        /// <param name="indexFilePath">Physical index storage file path.</param>
-        /// <param name="capacity">
-        ///     The capacity of physical index storage file on the harddisk.
-        ///     Capacity automatically increased to file size, or twice on overflow
-        /// </param>
         public PersistentIndex(string indexFilePath, long capacity = DefaultSizes.DefaultIndexBinCapacity)
         {
             _indexFilePath = indexFilePath;
             _capacity = capacity + DefaultSizes.CursorHolderSize;
+            _rootNode = new RootNode();
 
-            InitFile();
+            InitializeFile();
         }
 
         public void Add(string key, IndexData indexData)
         {
+            ValidateAddParameters(key, indexData);
+
             if (Contains(key))
             {
                 throw new DuplicateException(nameof(key));
             }
 
-            NewNode(key, indexData);
+            CreateNewNode(key, indexData);
         }
 
         public bool Contains(string key)
         {
-            return _rootNode.Nodes.Any(node => node.Key == key);
+            return _rootNode.Nodes.ContainsKey(key);
         }
 
         public IndexData Get(string key)
         {
-            if (string.IsNullOrEmpty(key))
-            {
-                throw new ArgumentNullException(nameof(key));
-            }
-
-            var keyInfo = new KeyInfo();
+            ValidateKey(key);
 
             try
             {
-                keyInfo = _rootNode.Nodes[key].KeyInfo; // faster than linq query
+                var keyInfo = _rootNode.Nodes[key].KeyInfo;
+                return ReadIndexDataFromFile(keyInfo);
             }
-            catch (KeyNotFoundException ex)
+            catch (KeyNotFoundException)
             {
-                throw ex;
+                throw;
             }
-
-            return ReadIndexData(keyInfo);
         }
 
-        //generates new node on the stream and adds this into rootNode.
-        private void NewNode(string key, IndexData indexData)
+        private void ValidateAddParameters(string key, IndexData indexData)
+        {
+            ValidateKey(key);
+            if (indexData == null)
+            {
+                throw new ArgumentNullException(nameof(indexData));
+            }
+            EnsureNotDisposed();
+        }
+
+        private void ValidateKey(string key)
         {
             if (string.IsNullOrEmpty(key))
             {
                 throw new ArgumentNullException(nameof(key));
             }
+        }
 
-            if (indexData == null)
-            {
-                throw new ArgumentNullException(nameof(indexData));
-            }
-
-            CheckDisposed();
-
+        private void CreateNewNode(string key, IndexData indexData)
+        {
             var keyBuffer = Encoding.UTF8.GetBytes(key);
-
             var newNodeSize = DefaultSizes.DefaultNodeSize + keyBuffer.Length;
 
             EnsureCapacity(_indexCursor, newNodeSize);
 
-            using (var writer = _indexFile.CreateViewStream(_indexCursor, newNodeSize, MemoryMappedFileAccess.Write))
-            {
-                var keyOffset = _indexCursor + DefaultSizes.DefaultNodeSize;
-
-                writer.WriteLong(keyOffset); // keyOffset
-                writer.WriteInt(keyBuffer.Length); //keySize
-                WriteIndexData(writer, indexData); //indexData
-                writer.Write(keyBuffer, 0, keyBuffer.Length); //key itself
-
-                _indexCursor += writer.Position;
-
-                var keyInfo = new KeyInfo
-                {
-                    Key = key,
-                    Offset = keyOffset,
-                    Size = keyBuffer.Length
-                };
-
-                var node = new Node()
-                {
-                    KeyInfo = keyInfo,
-                    IndexData = indexData,
-                };
-
-                //since we have to check if key exist before add new node, this approach accelerate check speed                 
-                _rootNode.Nodes.Add(key, node);
-            }
+            WriteNodeToFile(key, keyBuffer, indexData, newNodeSize);
+            AddNodeToRoot(key, keyBuffer, indexData);
 
             Commit();
         }
 
-        private static void WriteIndexData(Stream writer, IndexData data)
+        private void WriteNodeToFile(string key, byte[] keyBuffer, IndexData indexData, int newNodeSize)
+        {
+            using (var writer = _indexFile.CreateViewStream(_indexCursor, newNodeSize, MemoryMappedFileAccess.Write))
+            {
+                var keyOffset = _indexCursor + DefaultSizes.DefaultNodeSize;
+
+                writer.WriteLong(keyOffset);
+                writer.WriteInt(keyBuffer.Length);
+                WriteIndexDataToStream(writer, indexData);
+                writer.Write(keyBuffer, 0, keyBuffer.Length);
+
+                _indexCursor += writer.Position;
+            }
+        }
+
+        private void AddNodeToRoot(string key, byte[] keyBuffer, IndexData indexData)
+        {
+            var keyInfo = new KeyInfo
+            {
+                Key = key,
+                Offset = _indexCursor + DefaultSizes.DefaultNodeSize,
+                Size = keyBuffer.Length
+            };
+
+            var node = new Node
+            {
+                KeyInfo = keyInfo,
+                IndexData = indexData
+            };
+
+            _rootNode.Nodes.Add(key, node);
+        }
+
+        private static void WriteIndexDataToStream(Stream writer, IndexData data)
         {
             writer.WriteLong(data.Size);
             writer.WriteLong(data.Offset);
@@ -132,38 +133,34 @@ namespace BinStorage.Index
 
         private void EnsureCapacity(long cursor, int length)
         {
-            var required = cursor + length;
-            if (required <= _capacity)
+            var requiredCapacity = cursor + length;
+            if (requiredCapacity <= _capacity)
             {
                 return;
             }
 
-            //New file may need to be created with new capacity, for this reason exist _file must be released because previous process is using it. 
             ReleaseFile();
-
-            _capacity <<= 1;
-            if (required > _capacity)
-            {
-                _capacity = required;
-            }
-
-            InitFile();
+            _capacity = CalculateNewCapacity(requiredCapacity);
+            InitializeFile();
         }
 
-        private void CheckSpace()
+        private long CalculateNewCapacity(long requiredCapacity)
         {
-            if (GetFreeSpace() >= _capacity)
-            {
-                return;
-            }
+            var newCapacity = _capacity << 1;
+            return requiredCapacity > newCapacity ? requiredCapacity : newCapacity;
+        }
 
-            throw new NotEnoughDiskSpaceException("There is not enough space on the disk.");
+        private void EnsureDiskSpace()
+        {
+            if (GetFreeSpace() < _capacity)
+            {
+                throw new NotEnoughDiskSpaceException("There is not enough space on the disk.");
+            }
         }
 
         private long GetFreeSpace()
         {
             var pathRoot = Path.GetPathRoot(_indexFilePath);
-
             return DriveInfo.GetDrives()
                 .Where(drive => drive.IsReady && string.Equals(drive.Name, pathRoot, StringComparison.InvariantCultureIgnoreCase))
                 .Select(x => x.TotalFreeSpace)
@@ -183,19 +180,10 @@ namespace BinStorage.Index
             }
         }
 
-        //generate file with specified path and default capacity on the harddisk
-        private void InitFile()
+        private void InitializeFile()
         {
-            CheckSpace();
-
-            if (File.Exists(_indexFilePath))
-            {
-                var length = new FileInfo(_indexFilePath).Length;
-                if (_capacity < length)
-                {
-                    _capacity = length;
-                }
-            }
+            EnsureDiskSpace();
+            AdjustCapacityToFileSize();
 
             _indexFile = MemoryMappedFile.CreateFromFile(
                 _indexFilePath,
@@ -204,91 +192,22 @@ namespace BinStorage.Index
                 _capacity,
                 MemoryMappedFileAccess.ReadWrite);
 
-            InitRootAndCursor();
+            InitializeRootAndCursor();
         }
 
-        //reads all node
-        private void ReadRootNode()
+        private void AdjustCapacityToFileSize()
         {
-            var actualRootNode = new RootNode();
-
-            var offset = DefaultSizes.CursorHolderSize; // start read from cursor position
-            var size = _capacity - offset; // keep read until end of it
-
-            using (var reader = _indexFile.CreateViewStream(offset, size, MemoryMappedFileAccess.Read))
+            if (File.Exists(_indexFilePath))
             {
-                while (true)
+                var fileLength = new FileInfo(_indexFilePath).Length;
+                if (_capacity < fileLength)
                 {
-                    var keyOffset = reader.ReadLong();
-
-                    if (keyOffset == 0) // it means there are no more node to read
-                    {
-                        break;
-                    }
-
-                    var keySize = reader.ReadInt();
-                    var indexData = ReadIndexData(new KeyInfo { Offset = keyOffset, Size = keySize });
-                    var key = FetchKey(new KeyInfo { Offset = keyOffset, Size = keySize });
-
-                    reader.Position += DefaultSizes.IndexDataSize + key.Length; //jump to the next node's keyOffset
-
-                    var keyInfo = new KeyInfo
-                    {
-                        Key = key,
-                        Offset = keyOffset,
-                        Size = keySize
-                    };
-
-                    var node = new Node()
-                    {
-                        KeyInfo = keyInfo,
-                        IndexData = indexData,
-                    };
-
-                    actualRootNode.Nodes.Add(key, node);
+                    _capacity = fileLength;
                 }
             }
-
-            _rootNode = actualRootNode;
         }
 
-        private string FetchKey(KeyInfo keyInfo)
-        {
-            using (var reader = _indexFile.CreateViewAccessor(
-                keyInfo.Offset,
-                keyInfo.Size,
-                MemoryMappedFileAccess.Read))
-            {
-                return ReadKey(reader, keyInfo.Size);
-            }
-        }
-
-        private static string ReadKey(UnmanagedMemoryAccessor reader, int size)
-        {
-            var buffer = new byte[size];
-            reader.ReadArray(0, buffer, 0, size);
-
-            return Encoding.UTF8.GetString(buffer);
-        }
-
-        private IndexData ReadIndexData(KeyInfo keyInfo)
-        {
-            var offset = keyInfo.Offset - DefaultSizes.IndexDataSize; // Index data is stored before key
-            using (var reader = _indexFile.CreateViewStream(offset, DefaultSizes.IndexDataSize, MemoryMappedFileAccess.Read))
-            {
-                var indexData = new IndexData
-                {
-                    Md5Hash = new byte[DefaultSizes.Md5HashSize],
-                    Size = reader.ReadLong(),
-                    Offset = reader.ReadLong()
-                };
-                reader.Read(indexData.Md5Hash, 0, DefaultSizes.Md5HashSize);
-
-                return indexData;
-            }
-        }
-
-        private void InitRootAndCursor()
+        private void InitializeRootAndCursor()
         {
             using (var reader = _indexFile.CreateViewAccessor(DefaultSizes.CursorHolderOffset, DefaultSizes.CursorHolderSize, MemoryMappedFileAccess.Read))
             {
@@ -296,20 +215,75 @@ namespace BinStorage.Index
                 if (_indexCursor == 0)
                 {
                     _indexCursor = DefaultSizes.CursorHolderSize;
-
-                    _rootNode = new RootNode();
                 }
                 else
                 {
-                    ReadRootNode();
+                    LoadExistingNodes();
                 }
                 _cursorPositionBeforeAction = _indexCursor;
             }
         }
 
+        private void LoadExistingNodes()
+        {
+            var offset = DefaultSizes.CursorHolderSize;
+            var size = _capacity - offset;
+
+            using (var reader = _indexFile.CreateViewStream(offset, size, MemoryMappedFileAccess.Read))
+            {
+                while (true)
+                {
+                    var keyOffset = reader.ReadLong();
+                    if (keyOffset == 0)
+                    {
+                        break;
+                    }
+
+                    var keySize = reader.ReadInt();
+                    var keyInfo = new KeyInfo { Offset = keyOffset, Size = keySize };
+                    var indexData = ReadIndexDataFromFile(keyInfo);
+                    var key = ReadKeyFromFile(keyInfo);
+
+                    reader.Position += DefaultSizes.IndexDataSize + key.Length;
+
+                    AddNodeToRoot(key, Encoding.UTF8.GetBytes(key), indexData);
+                }
+            }
+        }
+
+        private string ReadKeyFromFile(KeyInfo keyInfo)
+        {
+            using (var reader = _indexFile.CreateViewAccessor(keyInfo.Offset, keyInfo.Size, MemoryMappedFileAccess.Read))
+            {
+                var buffer = new byte[keyInfo.Size];
+                reader.ReadArray(0, buffer, 0, keyInfo.Size);
+                return Encoding.UTF8.GetString(buffer);
+            }
+        }
+
+        private IndexData ReadIndexDataFromFile(KeyInfo keyInfo)
+        {
+            var offset = keyInfo.Offset - DefaultSizes.IndexDataSize;
+            using (var reader = _indexFile.CreateViewStream(offset, DefaultSizes.IndexDataSize, MemoryMappedFileAccess.Read))
+            {
+                return new IndexData
+                {
+                    Size = reader.ReadLong(),
+                    Offset = reader.ReadLong(),
+                    Md5Hash = ReadMd5Hash(reader)
+                };
+            }
+        }
+
+        private static byte[] ReadMd5Hash(Stream reader)
+        {
+            var md5Hash = new byte[DefaultSizes.Md5HashSize];
+            reader.Read(md5Hash, 0, DefaultSizes.Md5HashSize);
+            return md5Hash;
+        }
+
         public void Commit()
         {
-            //update _cursor position
             using (var writer = _indexFile.CreateViewAccessor(DefaultSizes.CursorHolderOffset, DefaultSizes.CursorHolderSize, MemoryMappedFileAccess.Write))
             {
                 writer.Write(DefaultSizes.CursorHolderOffset, _indexCursor);
@@ -318,21 +292,26 @@ namespace BinStorage.Index
 
         public void Rollback()
         {
-            //update cursor position value with previous value
+            ResetCursorPosition();
+            FlushStreamFromLastWrite();
+        }
+
+        private void ResetCursorPosition()
+        {
             using (var cursorHolder = _indexFile.CreateViewAccessor(0, DefaultSizes.CursorHolderSize, MemoryMappedFileAccess.Write))
             {
                 cursorHolder.Write(0, _cursorPositionBeforeAction);
             }
+        }
 
-            //flush the stream from last successfully write operation to end of the file
+        private void FlushStreamFromLastWrite()
+        {
             var size = _capacity - _cursorPositionBeforeAction;
             using (var writer = _indexFile.CreateViewStream(_cursorPositionBeforeAction, size, MemoryMappedFileAccess.Write))
             {
                 writer.Flush();
             }
         }
-
-        #region IDisposable
 
         public void Dispose()
         {
@@ -347,14 +326,15 @@ namespace BinStorage.Index
                 return;
             }
 
-            _indexFile?.Dispose();
+            if (disposing)
+            {
+                _indexFile?.Dispose();
+            }
 
             _disposed = true;
         }
 
-        private bool _disposed;
-
-        private void CheckDisposed()
+        private void EnsureNotDisposed()
         {
             if (_disposed)
             {
@@ -366,7 +346,5 @@ namespace BinStorage.Index
         {
             Dispose(false);
         }
-
-        #endregion
     }
 }
