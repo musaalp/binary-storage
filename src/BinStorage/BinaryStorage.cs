@@ -9,90 +9,107 @@ namespace BinStorage
     {
         private readonly IIndex _index;
         private readonly IStorage _storage;
+        private bool _isDisposed;
 
         public BinaryStorage(StorageConfiguration configuration)
         {
-            var storageFilePath = Path.Combine(configuration.WorkingFolder, configuration.StorageFileName);
-            var indexFilePath = Path.Combine(configuration.WorkingFolder, configuration.IndexFileName);
+            ValidateConfiguration(configuration);
 
-            _index = new ThreadSafeIndex(new PersistentIndex(indexFilePath), configuration.IndexTimeout);
+            var storageFilePath = CreateStoragePath(configuration);
+            var indexFilePath = CreateIndexPath(configuration);
+
+            _index = CreateThreadSafeIndex(indexFilePath, configuration.IndexTimeout);
             _storage = new FileStorage(storageFilePath);
         }
 
+        private static void ValidateConfiguration(StorageConfiguration configuration)
+        {
+            if (configuration == null)
+                throw new ArgumentNullException(nameof(configuration));
+            if (string.IsNullOrEmpty(configuration.WorkingFolder))
+                throw new ArgumentException("Working folder cannot be empty", nameof(configuration));
+        }
+
+        private static string CreateStoragePath(StorageConfiguration configuration)
+            => Path.Combine(configuration.WorkingFolder, configuration.StorageFileName);
+
+        private static string CreateIndexPath(StorageConfiguration configuration)
+            => Path.Combine(configuration.WorkingFolder, configuration.IndexFileName);
+
+        private static IIndex CreateThreadSafeIndex(string indexFilePath, TimeSpan indexTimeout)
+            => new ThreadSafeIndex(new PersistentIndex(indexFilePath), indexTimeout);
+
         public void Add(string key, Stream data)
         {
-            if (string.IsNullOrEmpty(key))
+            ValidateAddParameters(key, data);
+            EnsureNotDisposed();
+            
+            try
             {
-                throw new ArgumentNullException(nameof(key));
+                AddToStorage(key, data);
             }
-
-            if (data == null)
+            catch
             {
-                throw new ArgumentNullException(nameof(data));
+                Rollback();
+                throw;
             }
-
-            CheckDisposed();
-
-            TryAdd(key, data);
         }
 
-        //try add if any error happen, then rollback
-        private void TryAdd(string key, Stream data)
+        private void ValidateAddParameters(string key, Stream data)
+        {
+            if (string.IsNullOrEmpty(key))
+                throw new ArgumentNullException(nameof(key));
+            if (data == null)
+                throw new ArgumentNullException(nameof(data));
+        }
+
+        private void AddToStorage(string key, Stream data)
         {
             var indexData = _storage.Append(data);
-
             _index.Add(key, indexData);
-        }
-
-        public void Commit()
-        {
-            _storage.Commit();
-            _index.Commit();
-        }
-
-        //rollback from last successfully point, it takes cursor position as reference
-        public void Rollback()
-        {
-            _storage.Rollback();
-            _index.Rollback();
-        }
-
-        public bool Contains(string key)
-        {
-            if (string.IsNullOrEmpty(key))
-            {
-                throw new ArgumentNullException(nameof(key));
-            }
-
-            CheckDisposed();
-
-            return _index.Contains(key);
         }
 
         public Stream Get(string key)
         {
-            if (key == null)
-            {
-                throw new ArgumentNullException(nameof(key));
-            }
-
-            CheckDisposed();
+            ValidateKey(key);
+            EnsureNotDisposed();
 
             var indexData = _index.Get(key);
-
             return _storage.Get(indexData);
         }
 
-        #region IDisposable
-
-        private bool _disposed;
-
-        private void CheckDisposed()
+        private void ValidateKey(string key)
         {
-            if (_disposed)
-            {
-                throw new ObjectDisposedException("Binary storage is disposed");
-            }
+            if (string.IsNullOrEmpty(key))
+                throw new ArgumentNullException(nameof(key));
+        }
+
+        public bool Contains(string key)
+        {
+            ValidateKey(key);
+            EnsureNotDisposed();
+
+            return _index.Contains(key);
+        }
+
+        public void Commit()
+        {
+            EnsureNotDisposed();
+            _storage.Commit();
+            _index.Commit();
+        }
+
+        public void Rollback()
+        {
+            EnsureNotDisposed();
+            _storage.Rollback();
+            _index.Rollback();
+        }
+
+        private void EnsureNotDisposed()
+        {
+            if (_isDisposed)
+                throw new ObjectDisposedException(nameof(BinaryStorage));
         }
 
         public void Dispose()
@@ -103,20 +120,21 @@ namespace BinStorage
 
         protected virtual void Dispose(bool disposing)
         {
-            if (_disposed)
+            if (_isDisposed)
                 return;
 
-            _index.Dispose();
-            _storage.Dispose();
+            if (disposing)
+            {
+                _index.Dispose();
+                _storage.Dispose();
+            }
 
-            _disposed = true;
+            _isDisposed = true;
         }
 
         ~BinaryStorage()
         {
             Dispose(false);
         }
-
-        #endregion
     }
 }
